@@ -35,7 +35,7 @@ func (s *StandAloneStorage) Start() error {
 // Stop stops the standalone storage
 func (s *StandAloneStorage) Stop() error {
 	// Your Code Here (1).
-	return s.engine.Close()
+	return s.engine.Kv.Close()
 }
 
 // Reader returns reader for standalone storage

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 
 	"github.com/pingcap-incubator/tinykv/kv/coprocessor"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
@@ -15,6 +16,13 @@ import (
 
 var _ tinykvpb.TinyKvServer = new(Server)
 
+var (
+	// ErrBadgerFailed badger error
+	ErrBadgerFailed error = errors.New("Internal badger failed")
+	// ErrNilRequest nil request
+	ErrNilRequest error = errors.New("Nil request")
+)
+
 // Server is a TinyKV server, it 'faces outwards', sending and receiving messages from clients such as TinySQL.
 type Server struct {
 	storage storage.Storage
@@ -26,6 +34,7 @@ type Server struct {
 	copHandler *coprocessor.CopHandler
 }
 
+// NewServer returns a new RPC server instance
 func NewServer(storage storage.Storage) *Server {
 	return &Server{
 		storage: storage,
@@ -36,24 +45,98 @@ func NewServer(storage storage.Storage) *Server {
 // The below functions are Server's gRPC API (implements TinyKvServer).
 
 // Raw API.
+
+// RawGet query value for given key & cf and returns RawGetResponse and error if goes wrong
 func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kvrpcpb.RawGetResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	resp := &kvrpcpb.RawGetResponse{}
+	reader, err := server.storage.Reader(req.Context)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+	defer reader.Close()
+	value, err := reader.GetCF(req.Cf, req.Key)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+	if value == nil {
+		resp.NotFound = true
+		return resp, nil
+	}
+	resp.Value = value
+	return resp, nil
 }
 
+// RawPut applies raw put opertion and returns response and error if goes wrong
 func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kvrpcpb.RawPutResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	resp := &kvrpcpb.RawPutResponse{}
+	writeBatch := []storage.Modify{
+		{
+			Data: storage.Put{
+				Key:   req.Key,
+				Value: req.Value,
+				Cf:    req.Cf,
+			},
+		},
+	}
+	err := server.storage.Write(req.Context, writeBatch)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+	return resp, nil
 }
 
+// RawDelete applies delete operation for given key & cf and returns response and error if goes wrong
 func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest) (*kvrpcpb.RawDeleteResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	resp := &kvrpcpb.RawDeleteResponse{}
+	delBatch := []storage.Modify{
+		{
+			Data: storage.Delete{
+				Key: req.Key,
+				Cf:  req.Cf,
+			},
+		},
+	}
+	err := server.storage.Write(req.Context, delBatch)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+	return resp, nil
 }
 
+// RawScan executes
 func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*kvrpcpb.RawScanResponse, error) {
 	// Your Code Here (1).
-	return nil, nil
+	resp := &kvrpcpb.RawScanResponse{}
+	scanner, err := server.storage.Reader(req.Context)
+	if err != nil {
+		resp.Error = err.Error()
+		return resp, err
+	}
+	defer scanner.Close()
+	iterator := scanner.IterCF(req.Cf)
+	defer iterator.Close()
+	iterator.Seek(req.StartKey)
+	for i := uint32(0); iterator.Valid() && i < req.Limit; i++ {
+		item := iterator.Item()
+		val, err := item.Value()
+		kv := &kvrpcpb.KvPair{}
+		if err != nil {
+			kv.Error = &kvrpcpb.KeyError{Retryable: err.Error()}
+		} else {
+			kv.Key = item.Key()
+			kv.Value = val
+		}
+		resp.Kvs = append(resp.Kvs, kv)
+		iterator.Next()
+	}
+	return resp, nil
 }
 
 // Raft commands (tinykv <-> tinykv)
