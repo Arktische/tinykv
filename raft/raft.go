@@ -109,13 +109,12 @@ type Progress struct {
 
 type Raft struct {
 	id uint64
-
+	/* persisted state for raft node */
 	Term uint64
 	Vote uint64
-
 	// the log
 	RaftLog *RaftLog
-
+	/* volatiled state for raft node, reinitialized after election */
 	// log replication progress of each peers
 	Prs map[uint64]*Progress
 
@@ -165,7 +164,18 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	hardState, confState, err := c.Storage.InitialState()
+	if err != nil {
+
+	}
+	// hardState
+	return &Raft{
+		id:               c.ID,
+		Term:             hardState.Term,
+		Vote:             hardState.Vote,
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout:  c.ElectionTick,
+	}
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -178,11 +188,22 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	heartbeatTyp := pb.MessageType_MsgHeartbeat
+	if r.State != StateLeader {
+		heartbeatTyp = pb.MessageType_MsgHeartbeatResponse
+	}
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: heartbeatTyp,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+	})
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
+	r.Term++
 }
 
 // becomeFollower transform this peer's state to Follower
@@ -207,8 +228,14 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
+		if m.MsgType == pb.MessageType_MsgHeartbeat {
+			r.handleHeartbeat(m)
+		}
 	case StateCandidate:
 	case StateLeader:
+		if m.MsgType == pb.MessageType_MsgHeartbeatResponse {
+
+		}
 	}
 	return nil
 }
@@ -221,6 +248,14 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	if m.Term > r.Term {
+	}
+	switch r.State {
+	case StateFollower:
+		if m.Term > r.Term {
+			r.Term = m.Term
+		}
+	}
 }
 
 // handleSnapshot handle Snapshot RPC request
