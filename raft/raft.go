@@ -114,7 +114,7 @@ type Raft struct {
 	Vote uint64
 	// the log
 	RaftLog *RaftLog
-	/* volatiled state for raft node, reinitialized after election */
+	/* volatile state for leader raft node, reinitialized after election */
 	// log replication progress of each peers
 	Prs map[uint64]*Progress
 
@@ -164,17 +164,26 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	hardState, confState, err := c.Storage.InitialState()
-	if err != nil {
-
-	}
-	// hardState
+	hardState, confState, _ := c.Storage.InitialState()
+	lo, _ := c.Storage.FirstIndex()
+	hi, _ := c.Storage.LastIndex()
+	// logs.Infof("lo is %v, hi is %v", lo, hi)
+	ents, _ := c.Storage.Entries(lo, hi+1)
 	return &Raft{
 		id:               c.ID,
-		Term:             hardState.Term,
-		Vote:             hardState.Vote,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
+		Term:             hardState.Term,
+		Vote:             hardState.Vote,
+		RaftLog: &RaftLog{
+			storage:   c.Storage,
+			applied:   c.Applied,
+			entries:   ents,
+			committed: hardState.Commit,
+			stabled:   hardState.Commit,
+		},
+		votes: make(map[uint64]bool, len(confState.Nodes)),
+		Prs:   make(map[uint64]*Progress, len(confState.Nodes)),
 	}
 }
 
@@ -188,32 +197,88 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-	heartbeatTyp := pb.MessageType_MsgHeartbeat
-	if r.State != StateLeader {
-		heartbeatTyp = pb.MessageType_MsgHeartbeatResponse
-	}
+	// heartbeatTyp := pb.MessageType_MsgHeartbeat
+	// if r.State != StateLeader {
+	// 	heartbeatTyp = pb.MessageType_MsgHeartbeatResponse
+	// }
 	r.msgs = append(r.msgs, pb.Message{
-		MsgType: heartbeatTyp,
+		MsgType: pb.MessageType_MsgHeartbeat,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
 	})
 }
 
+func (r *Raft) sendRequestVote(to uint64) {
+	lastLogIndex := r.RaftLog.LastIndex()
+	lastLogTerm, _ := r.RaftLog.Term(lastLogIndex)
+	for peerID := range r.Prs {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgRequestVote,
+			To:      peerID,
+			From:    r.id,
+			Term:    r.Term,
+			Index:   lastLogIndex,
+			LogTerm: lastLogTerm,
+		})
+	}
+}
+
+func (r *Raft) sendHeartbeatResp(to uint64, rej bool) {
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  rej,
+	})
+}
+
+func (r *Raft) sendRequestVoteResp(votedFor uint64, rej bool) {
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgRequestVoteResponse,
+		To:      votedFor,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  rej,
+	})
+	// votes[votedFor] = true
+}
+
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
 	// Your Code Here (2A).
 	r.Term++
+	r.Vote = None
+	r.votes = make(map[uint64]bool)
+}
+
+// updateTerm updates current term to given term only when
+// cur term <= given term, and reset the vote
+func (r *Raft) updateTerm(to uint64) {
+	if to < r.Term {
+		return
+	}
+	r.Term = to
+	// clear votedFor & votes track map
+	r.Vote = None
+	r.votes = make(map[uint64]bool)
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// Your Code Here (2A).
+	r.State = StateFollower
+	r.Lead = lead
+	// r.Term = term
+	r.updateTerm(term)
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
 	// Your Code Here (2A).
+	r.State = StateCandidate
+	r.Lead = None
 }
 
 // becomeLeader transform this peer's state to leader
@@ -234,10 +299,36 @@ func (r *Raft) Step(m pb.Message) error {
 	case StateCandidate:
 	case StateLeader:
 		if m.MsgType == pb.MessageType_MsgHeartbeatResponse {
-
+			r.handleHearbeatResp(m)
 		}
 	}
 	return nil
+}
+
+func (r *Raft) handleRequestVote(m pb.Message) {
+	if r.Term > m.Term {
+		r.sendRequestVoteResp(None, true)
+		return
+	}
+	if r.Term < m.Term {
+		r.becomeFollower(m.Term, None)
+	}
+	lastLogIndex := r.RaftLog.LastIndex()
+	lastLogTerm, err := r.RaftLog.Term(lastLogIndex)
+	if err != nil {
+		panic("invalid lastLogIndex, raft state machine is in chaos state")
+	}
+	if (r.Vote == None || r.Vote == m.From) &&
+		(lastLogIndex <= m.Index && lastLogTerm <= m.LogTerm) {
+		r.sendRequestVoteResp(m.From, false)
+		return
+	}
+	// reject the out-of-date RequestVote
+	r.sendRequestVoteResp(None, true)
+}
+
+func (r *Raft) handleRequestVoteResp(m pb.Message) {
+
 }
 
 // handleAppendEntries handle AppendEntries RPC request
@@ -248,14 +339,32 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-	if m.Term > r.Term {
+	// if Term of rcvd req > cur raft Term, override it
+	// with rcvd Term. Discard the req when Term of
+	// req < cur raft Term
+	if r.Term < m.Term {
+		r.updateTerm(m.Term)
+		r.becomeFollower(m.Term, m.From)
+		r.sendHeartbeatResp(m.From, false)
+		return
+	} else if r.Term == m.Term {
+		r.sendHeartbeatResp(m.From, false)
+		return
 	}
-	switch r.State {
-	case StateFollower:
-		if m.Term > r.Term {
-			r.Term = m.Term
-		}
+	r.sendHeartbeatResp(m.From, true)
+}
+
+func (r *Raft) handleHearbeatResp(m pb.Message) {
+	// when leader rcvd higher term heartbeat response
+	if r.Term < m.Term {
+		r.updateTerm(m.Term)
+		r.becomeFollower(m.Term, m.From)
+		return
 	}
+}
+
+func (r *Raft) handleAppendEntriesResp(m pb.Message) {
+
 }
 
 // handleSnapshot handle Snapshot RPC request
